@@ -54,3 +54,32 @@ When enabled, only logged-in users with the appropriate capability can use `?cha
 ## License
 
 GPLv2 or later
+
+## Security boundaries
+
+Propose-only users can create and edit their own changesets. Users with
+`manage_changesets` can collaborate across sessions. Approval and publication
+require their dedicated Changesets capabilities; staging, approving and publishing
+settings also require `manage_options`.
+
+Public preview URLs are UUID bearer links: anyone holding a valid link can see
+that changeset unless private preview mode is enabled. UUIDs cannot be replaced
+with numeric database IDs. Preview overlays are limited to presentation settings;
+unknown plugin options remain administrative staging/publication work and are not
+applied to public requests. Trusted site code can extend the presentation list
+through `cs_previewable_options` after checking the setting's effects.
+
+Option names must use printable ASCII without surrounding whitespace. Security,
+registration, role-definition, bootstrap and internal publication-lock options
+cannot be staged. Global styles are sanitized, and custom CSS proposals require
+`edit_css` and cannot contain markup. Safe visual style proposals remain available.
+
+Approval covers a fingerprint of the payload. Existing approvals created before
+this protection require fresh approval. Publication captures and applies the
+approved snapshot and locks the changeset against simultaneous external edits.
+Locks are released on normal completion and exceptions. If a PHP worker is killed
+abruptly, an administrator must first verify that publication has stopped, then
+remove the orphan `_changeset_publish_lock_<ID>` option via WP-CLI before retrying;
+do not remove a lock from an active publication.
+
+See [local security tests](tests/README.md) for validation coverage and commands.

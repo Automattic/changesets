@@ -178,7 +178,7 @@ function cs_changeset_row_actions( $actions, $post ) {
 	$url    = cs_get_preview_url( $post->ID );
 
 	$out = array();
-	if ( $url && in_array( $status, array( 'open', 'approved' ), true ) ) {
+	if ( cs_user_can_access_changeset( $post->ID ) && $url && in_array( $status, array( 'open', 'approved' ), true ) ) {
 		$out['cs_preview'] = sprintf(
 			'<a href="%s">%s</a>',
 			esc_url( $url ),
@@ -205,7 +205,7 @@ function cs_changeset_edit_link_to_preview( $url, $post_id, $context = 'display'
 	}
 	$status  = cs_get_changeset_status( $post->ID );
 	$preview = cs_get_preview_url( $post->ID );
-	if ( $preview && in_array( $status, array( 'open', 'approved' ), true ) ) {
+	if ( cs_user_can_access_changeset( $post->ID ) && $preview && in_array( $status, array( 'open', 'approved' ), true ) ) {
 		return $preview;
 	}
 	return $url;
@@ -240,3 +240,21 @@ function cs_previewing_admin_body_class( $classes ) {
 	return $classes;
 }
 add_filter( 'body_class', 'cs_previewing_admin_body_class' );
+
+/** Keep native administrative and REST collections scoped to proposal ownership. */
+function cs_scope_native_changeset_query( $query ) {
+	if ( is_admin() && $query->is_main_query() && 'changeset' === $query->get( 'post_type' ) && ! current_user_can( 'manage_changesets' ) ) {
+		$query->set( 'author', get_current_user_id() );
+		$query->set( 'author__in', array() );
+		$query->set( 'author__not_in', array() );
+	}
+}
+add_action( 'pre_get_posts', 'cs_scope_native_changeset_query' );
+function cs_scope_rest_changeset_query( $args ) {
+	if ( ! current_user_can( 'manage_changesets' ) ) {
+		$args['author'] = get_current_user_id();
+		unset( $args['author__in'], $args['author__not_in'] );
+	}
+	return $args;
+}
+add_filter( 'rest_changeset_query', 'cs_scope_rest_changeset_query' );

@@ -234,6 +234,9 @@ function cs_is_changeset_approved( $changeset_id ) {
  * @return true|WP_Error
  */
 function cs_approve_changeset( $changeset_id ) {
+	if ( cs_changeset_is_publishing( $changeset_id ) ) {
+		return new WP_Error( 'cs_publishing', __( 'This changeset is publishing.', 'changesets' ) );
+	}
 	$changeset = cs_get_changeset( $changeset_id );
 	if ( ! $changeset ) {
 		return new WP_Error( 'cs_not_changeset', __( 'Not a changeset.', 'changesets' ) );
@@ -247,6 +250,7 @@ function cs_approve_changeset( $changeset_id ) {
 		return new WP_Error( 'cs_closed_changeset', __( 'Cannot approve a closed changeset.', 'changesets' ) );
 	}
 
+	update_post_meta( $changeset_id, '_changeset_approved_hash', cs_payload_hash( cs_get_changeset_payload( $changeset_id ) ) );
 	update_post_meta( $changeset_id, '_changeset_status', 'approved' );
 	update_post_meta( $changeset_id, '_changeset_approved_by', get_current_user_id() );
 	update_post_meta( $changeset_id, '_changeset_approved_at', gmdate( 'c' ) );
@@ -305,6 +309,10 @@ function cs_stage_content( $changeset_id, $source_id, $post_type = '' ) {
 	$source = get_post( $source_id );
 	if ( ! $source ) {
 		return new WP_Error( 'cs_invalid_source', __( 'Source post not found.', 'changesets' ) );
+	}
+
+	if ( $post_type && $post_type !== $source->post_type ) {
+		return new WP_Error( 'cs_source_type_mismatch', __( 'Source post type does not match.', 'changesets' ) );
 	}
 
 	// Use source's post type if not specified.
@@ -476,6 +484,14 @@ function cs_set_staged_global_styles( $changeset_id, $data ) {
 	if ( empty( $data['version'] ) ) {
 		$data['version'] = 3;
 	}
+	$css = array();
+	cs_extract_style_css( $data, $css );
+	foreach ( $css as $entry ) {
+		if ( ! is_string( $entry['value'] ) || preg_match( '#</?\w+#', $entry['value'] ) ) {
+			return new WP_Error( 'cs_unsafe_css', __( 'Custom CSS requires edit_css and cannot contain markup.', 'changesets' ) );
+		}
+	}
+	$data = cs_sanitize_global_styles( $data );
 	update_post_meta( (int) $changeset_id, '_changeset_staged_global_styles', $data );
 	return true;
 }
@@ -488,6 +504,11 @@ function cs_set_staged_global_styles( $changeset_id, $data ) {
  * @return array|WP_Error
  */
 function cs_stage_global_styles( $changeset_id, $patch ) {
+	$css = array();
+	cs_extract_style_css( $patch, $css );
+	if ( $css && ! current_user_can( 'edit_css' ) ) {
+		return new WP_Error( 'cs_unsafe_css', __( 'Custom CSS requires edit_css.', 'changesets' ) );
+	}
 	$changeset = cs_get_changeset( $changeset_id );
 	if ( ! $changeset ) {
 		return new WP_Error( 'cs_invalid_changeset', __( 'Invalid changeset.', 'changesets' ) );
@@ -821,211 +842,237 @@ function cs_publish_changeset( $changeset_id ) {
 	if ( ! cs_is_changeset_approved( $changeset_id ) ) {
 		return new WP_Error( 'cs_not_approved', __( 'Approve the changeset before publishing.', 'changesets' ) );
 	}
-	$options = cs_get_staged_options( $changeset_id );
-	if ( $options && ! current_user_can( 'manage_options' ) ) {
-		return new WP_Error( 'cs_forbidden', __( 'You cannot publish settings.', 'changesets' ) );
+	$lock_key = '_changeset_publish_lock_' . $changeset_id;
+	if ( ! add_option( $lock_key, time(), '', false ) ) {
+		return new WP_Error( 'cs_publishing', __( 'This changeset is already publishing.', 'changesets' ) );
 	}
-	foreach ( $options as $key => $item ) {
-		$store = cs_get_staged_option_store( $item );
-		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
-			return new WP_Error( 'cs_denylisted_option', __( 'This changeset contains an unsafe option.', 'changesets' ) );
+	$cs_publishing_changeset = $changeset_id;
+	try {
+		$payload = cs_get_changeset_payload( $changeset_id );
+		$approved_hash = get_post_meta( $changeset_id, '_changeset_approved_hash', true );
+		if ( ! is_string( $approved_hash ) || ! hash_equals( $approved_hash, cs_payload_hash( $payload ) ) ) {
+			update_post_meta( $changeset_id, '_changeset_status', 'open' );
+			delete_post_meta( $changeset_id, '_changeset_approved_hash' );
+			delete_post_meta( $changeset_id, '_changeset_approved_by' );
+			delete_post_meta( $changeset_id, '_changeset_approved_at' );
+			return new WP_Error( 'cs_not_approved', __( 'The current payload needs fresh approval.', 'changesets' ) );
 		}
-	}
-
-	// Set internal flag to bypass staged-publish guard during this operation.
-	$cs_publishing_changeset = true;
-
-	$staged_ids      = cs_get_staged_drafts( $changeset_id );
-	$applied         = 0;
-	$published_new   = 0;
-	$source_ids      = array();
-	$staged_to_live  = array();
-	$failed_items    = array();
-
-	foreach ( $staged_ids as $staged_id ) {
-		$staged    = get_post( $staged_id );
-		$source_id = cs_get_staged_source_id( $staged_id );
-
-		if ( ! $staged ) {
-			continue;
+		$options = $payload['options'];
+		if ( $options && ! current_user_can( 'manage_options' ) ) {
+			return new WP_Error( 'cs_forbidden', __( 'You cannot publish settings.', 'changesets' ) );
+		}
+		foreach ( $options as $key => $item ) {
+			$store = cs_get_staged_option_store( $item );
+			if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+				return new WP_Error( 'cs_denylisted_option', __( 'This changeset contains an unsafe option.', 'changesets' ) );
+			}
 		}
 
-		if ( $source_id > 0 ) {
-			$source = get_post( $source_id );
-			if ( ! $source ) {
-				$failed_items[] = array(
-					'staged_id' => $staged_id,
-					'reason'    => 'Source post not found',
-				);
+		// Set internal flag to bypass staged-publish guard during this operation.
+		$cs_publishing_changeset = $changeset_id;
+
+		$staged_ids      = array_keys( $payload['posts'] );
+		$applied         = 0;
+		$published_new   = 0;
+		$source_ids      = array();
+		$staged_to_live  = array();
+		$failed_items    = array();
+
+		foreach ( $staged_ids as $staged_id ) {
+			$staged    = $payload['posts'][ $staged_id ];
+			$source_id = $payload['sources'][ $staged_id ];
+
+			if ( ! $staged ) {
 				continue;
 			}
 
-			// For templates/parts/navigation, they might be in 'publish' or 'auto-draft' status.
-			// For pages/posts, require 'publish' status.
-			$requires_publish = in_array( $staged->post_type, array( 'page', 'post' ), true );
-			if ( $requires_publish && 'publish' !== $source->post_status ) {
-				$failed_items[] = array(
-					'staged_id' => $staged_id,
-					'source_id' => $source_id,
-					'reason'    => 'Source is not published',
-				);
-				continue;
-			}
-
-			wp_save_post_revision( $source_id );
-
-			wp_update_post(
-				array(
-					'ID'           => $source_id,
-					'post_title'   => $staged->post_title,
-					'post_content' => $staged->post_content,
-					'post_excerpt' => $staged->post_excerpt,
-				),
-				true
-			);
-
-			$thumb = get_post_thumbnail_id( $staged_id );
-			if ( $thumb ) {
-				set_post_thumbnail( $source_id, $thumb );
-			} else {
-				delete_post_thumbnail( $source_id );
-			}
-
-			foreach ( array( 'category', 'post_tag' ) as $taxonomy ) {
-				if ( ! taxonomy_exists( $taxonomy ) || ! is_object_in_taxonomy( $source->post_type, $taxonomy ) ) {
+			if ( $source_id > 0 ) {
+				$source = get_post( $source_id );
+				if ( ! $source ) {
+					$failed_items[] = array(
+						'staged_id' => $staged_id,
+						'reason'    => 'Source post not found',
+					);
 					continue;
 				}
-				$terms = wp_get_object_terms( $staged_id, $taxonomy, array( 'fields' => 'ids' ) );
-				if ( ! is_wp_error( $terms ) ) {
-					wp_set_object_terms( $source_id, $terms, $taxonomy );
+
+				// For templates/parts/navigation, they might be in 'publish' or 'auto-draft' status.
+				// For pages/posts, require 'publish' status.
+				$requires_publish = in_array( $staged->post_type, array( 'page', 'post' ), true );
+				if ( $requires_publish && 'publish' !== $source->post_status ) {
+					$failed_items[] = array(
+						'staged_id' => $staged_id,
+						'source_id' => $source_id,
+						'reason'    => 'Source is not published',
+					);
+					continue;
+				}
+
+				wp_save_post_revision( $source_id );
+
+				wp_update_post(
+					array(
+						'ID'           => $source_id,
+						'post_title'   => $staged->post_title,
+						'post_content' => $staged->post_content,
+						'post_excerpt' => $staged->post_excerpt,
+					),
+					true
+				);
+
+				$thumb = $payload['thumbnails'][ $staged_id ];
+				if ( $thumb ) {
+					set_post_thumbnail( $source_id, $thumb );
+				} else {
+					delete_post_thumbnail( $source_id );
+				}
+
+				foreach ( array( 'category', 'post_tag' ) as $taxonomy ) {
+					if ( ! taxonomy_exists( $taxonomy ) || ! is_object_in_taxonomy( $source->post_type, $taxonomy ) ) {
+						continue;
+					}
+					$terms = $payload['terms'][ $staged_id ][ $taxonomy ];
+					if ( ! is_wp_error( $terms ) ) {
+						wp_set_object_terms( $source_id, $terms, $taxonomy );
+					}
+				}
+
+				wp_delete_post( $staged_id, true );
+				$staged_to_live[ $staged_id ] = $source_id;
+				$source_ids[] = $source_id;
+				$applied++;
+			} else {
+				// Promote brand-new staged content to live publish.
+				// Keep the association locked until the approved snapshot is fully applied.
+				$result = wp_update_post(
+					array(
+						'ID'          => $staged_id,
+						'post_status' => 'publish',
+						'post_type' => $staged->post_type,
+						'post_author' => $staged->post_author,
+					'post_password' => $staged->post_password,
+						'post_title' => $staged->post_title,
+						'post_content' => $staged->post_content,
+						'post_excerpt' => $staged->post_excerpt,
+						'post_name' => $staged->post_name,
+						'post_parent' => $staged->post_parent,
+						'menu_order' => $staged->menu_order,
+					),
+					true
+				);
+
+				if ( is_wp_error( $result ) ) {
+					$failed_items[] = array(
+						'staged_id' => $staged_id,
+						'reason'    => $result->get_error_message(),
+					);
+					continue;
+				}
+
+				// Verify final status is publish.
+				$published_post = get_post( $staged_id );
+				if ( ! $published_post || 'publish' !== $published_post->post_status ) {
+					$failed_items[] = array(
+						'staged_id'    => $staged_id,
+						'reason'       => 'Failed to reach publish status',
+						'final_status' => $published_post ? $published_post->post_status : 'unknown',
+					);
+					continue;
+				}
+
+				if ( $payload['thumbnails'][ $staged_id ] ) {
+					set_post_thumbnail( $staged_id, $payload['thumbnails'][ $staged_id ] );
+				} else {
+					delete_post_thumbnail( $staged_id );
+				}
+				foreach ( $payload['terms'][ $staged_id ] as $taxonomy => $terms ) {
+					wp_set_object_terms( $staged_id, $terms, $taxonomy );
+				}
+				delete_post_meta( $staged_id, '_changeset_is_staged' );
+				delete_post_meta( $staged_id, '_changeset_id' );
+				delete_post_meta( $staged_id, CS_META_SOURCE );
+				$staged_to_live[ $staged_id ] = $staged_id;
+				$source_ids[] = $staged_id;
+				$published_new++;
+			}
+		}
+
+		// Apply settings with ID remapping AFTER content is published.
+		$options = $payload['options'];
+		if ( $options ) {
+			foreach ( $options as $key => $item ) {
+				// Backward compatibility: direct values (0.4.2) vs new structure (0.5.0+).
+				if ( is_array( $item ) && isset( $item['value'] ) ) {
+					$value = $item['value'];
+					$store = cs_get_staged_option_store( $item );
+				} else {
+					// Old format: direct value, assume option store.
+					$value = $item;
+					$store = 'option';
+				}
+
+				// Remap staged IDs to live IDs for settings that reference posts.
+				if ( in_array( $key, array( 'page_on_front', 'page_for_posts', 'site_icon', 'custom_logo' ), true ) && isset( $staged_to_live[ $value ] ) ) {
+					$value = $staged_to_live[ $value ];
+				}
+
+				if ( 'theme_mod' === $store ) {
+					set_theme_mod( $key, $value );
+				} else {
+					update_option( $key, $value );
 				}
 			}
+			delete_post_meta( $changeset_id, '_changeset_staged_options' );
+		}
 
-			wp_delete_post( $staged_id, true );
-			$staged_to_live[ $staged_id ] = $source_id;
-			$source_ids[] = $source_id;
-			$applied++;
-		} else {
-			// Promote brand-new staged content to live publish.
-			// Clear staged markers FIRST to prevent guard from blocking.
-			delete_post_meta( $staged_id, '_changeset_is_staged' );
-			delete_post_meta( $staged_id, '_changeset_id' );
-			delete_post_meta( $staged_id, CS_META_SOURCE );
-
-			$result = wp_update_post(
-				array(
-					'ID'          => $staged_id,
-					'post_status' => 'publish',
-				),
-				true
-			);
-
-			if ( is_wp_error( $result ) ) {
-				$failed_items[] = array(
-					'staged_id' => $staged_id,
-					'reason'    => $result->get_error_message(),
+		$staged_styles = $payload['styles'];
+		if ( $staged_styles ) {
+			$user_post = null;
+			if ( class_exists( 'WP_Theme_JSON_Resolver' ) ) {
+				$user_post = WP_Theme_JSON_Resolver::get_user_data_from_wp_global_styles( wp_get_theme(), true );
+			}
+			if ( is_array( $user_post ) && ! empty( $user_post['ID'] ) ) {
+				$style_payload = cs_sanitize_global_styles( $staged_styles );
+				$style_payload['isGlobalStylesUserThemeJSON'] = true;
+				$style_payload['version']                     = isset( $style_payload['version'] ) ? $style_payload['version'] : 3;
+				wp_update_post(
+					array(
+						'ID'           => (int) $user_post['ID'],
+						'post_content' => wp_slash( wp_json_encode( $style_payload ) ),
+					),
+					true
 				);
-				continue;
 			}
-
-			// Verify final status is publish.
-			$published_post = get_post( $staged_id );
-			if ( ! $published_post || 'publish' !== $published_post->post_status ) {
-				$failed_items[] = array(
-					'staged_id'    => $staged_id,
-					'reason'       => 'Failed to reach publish status',
-					'final_status' => $published_post ? $published_post->post_status : 'unknown',
-				);
-				continue;
-			}
-
-			$staged_to_live[ $staged_id ] = $staged_id;
-			$source_ids[] = $staged_id;
-			$published_new++;
+			delete_post_meta( $changeset_id, '_changeset_staged_global_styles' );
+			delete_post_meta( $changeset_id, '_changeset_staged_style_variation' );
+			delete_post_meta( $changeset_id, '_changeset_staged_style_variation_title' );
 		}
-	}
 
-	// Apply settings with ID remapping AFTER content is published.
-	$options = cs_get_staged_options( $changeset_id );
-	if ( $options ) {
-		foreach ( $options as $key => $item ) {
-			// Backward compatibility: direct values (0.4.2) vs new structure (0.5.0+).
-			if ( is_array( $item ) && isset( $item['value'] ) ) {
-				$value = $item['value'];
-				$store = cs_get_staged_option_store( $item );
-			} else {
-				// Old format: direct value, assume option store.
-				$value = $item;
-				$store = 'option';
-			}
+		update_post_meta( $changeset_id, '_changeset_status', 'published' );
+		update_post_meta( $changeset_id, '_changeset_published_at', gmdate( 'c' ) );
+		update_post_meta( $changeset_id, '_changeset_published_by', get_current_user_id() );
+		$cs_publishing_changeset = false;
 
-			// Remap staged IDs to live IDs for settings that reference posts.
-			if ( in_array( $key, array( 'page_on_front', 'page_for_posts', 'site_icon', 'custom_logo' ), true ) && isset( $staged_to_live[ $value ] ) ) {
-				$value = $staged_to_live[ $value ];
-			}
+		cs_clear_preview_cookie();
 
-			if ( 'theme_mod' === $store ) {
-				set_theme_mod( $key, $value );
-			} else {
-				update_option( $key, $value );
-			}
+		$result = array(
+			'changeset_id'        => $changeset_id,
+			'applied_count'       => $applied,
+			'published_new_count' => $published_new,
+			'source_ids'          => $source_ids,
+			'status'              => 'published',
+		);
+
+		if ( ! empty( $failed_items ) ) {
+			$result['failed_items'] = $failed_items;
+			$result['partial_success'] = true;
 		}
-		delete_post_meta( $changeset_id, '_changeset_staged_options' );
+
+		return $result;
+	} finally {
+		$cs_publishing_changeset = false;
+		delete_option( $lock_key );
 	}
-
-	$staged_styles = cs_get_staged_global_styles( $changeset_id );
-	if ( ! $staged_styles ) {
-		$variation_stem = cs_get_staged_style_variation( $changeset_id );
-		if ( $variation_stem ) {
-			$resolved = cs_resolve_style_variation( $variation_stem );
-			if ( ! is_wp_error( $resolved ) ) {
-				$staged_styles = $resolved['data'];
-			}
-		}
-	}
-	if ( $staged_styles ) {
-		$user_post = null;
-		if ( class_exists( 'WP_Theme_JSON_Resolver' ) ) {
-			$user_post = WP_Theme_JSON_Resolver::get_user_data_from_wp_global_styles( wp_get_theme(), true );
-		}
-		if ( is_array( $user_post ) && ! empty( $user_post['ID'] ) ) {
-			$payload                               = $staged_styles;
-			$payload['isGlobalStylesUserThemeJSON'] = true;
-			$payload['version']                     = isset( $payload['version'] ) ? $payload['version'] : 3;
-			wp_update_post(
-				array(
-					'ID'           => (int) $user_post['ID'],
-					'post_content' => wp_slash( wp_json_encode( $payload ) ),
-				),
-				true
-			);
-		}
-		delete_post_meta( $changeset_id, '_changeset_staged_global_styles' );
-		delete_post_meta( $changeset_id, '_changeset_staged_style_variation' );
-		delete_post_meta( $changeset_id, '_changeset_staged_style_variation_title' );
-	}
-
-	update_post_meta( $changeset_id, '_changeset_status', 'published' );
-	update_post_meta( $changeset_id, '_changeset_published_at', gmdate( 'c' ) );
-	update_post_meta( $changeset_id, '_changeset_published_by', get_current_user_id() );
-	$cs_publishing_changeset = false;
-
-	cs_clear_preview_cookie();
-
-	$result = array(
-		'changeset_id'        => $changeset_id,
-		'applied_count'       => $applied,
-		'published_new_count' => $published_new,
-		'source_ids'          => $source_ids,
-		'status'              => 'published',
-	);
-
-	if ( ! empty( $failed_items ) ) {
-		$result['failed_items'] = $failed_items;
-		$result['partial_success'] = true;
-	}
-
-	return $result;
 }
 
 /**
@@ -1105,6 +1152,9 @@ function cs_list_changesets( $args = array() ) {
 		'order'          => 'DESC',
 	);
 
+	if ( ! current_user_can( 'manage_changesets' ) ) {
+		$query_args['author'] = get_current_user_id();
+	}
 	$q = new WP_Query( $query_args );
 	$items = array();
 	foreach ( $q->posts as $post ) {
@@ -1146,7 +1196,7 @@ function cs_prevent_staged_publish( $new_status, $old_status, $post ) {
 	}
 
 	// Allow publish during cs_publish_changeset internal workflow.
-	if ( ! empty( $cs_publishing_changeset ) ) {
+	if ( $cs_publishing_changeset && (int) $cs_publishing_changeset === cs_get_staged_changeset_id( $post->ID ) ) {
 		return;
 	}
 
@@ -1441,7 +1491,7 @@ function cs_preview_init_dynamic_filters() {
 
 	foreach ( $bag as $key => $item ) {
 		$store = cs_get_staged_option_store( $item );
-		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+		if ( ! cs_is_previewable_option( $key, $store ) ) {
 			continue;
 		}
 		// Backward compatibility: 0.5.0+ structure { value, store } vs 0.4.2 direct value.
@@ -1464,7 +1514,7 @@ add_action( 'init', 'cs_preview_init_dynamic_filters', 20 );
  * @return mixed
  */
 function cs_preview_filter_option( $pre, $option ) {
-	if ( ! cs_is_safe_staged_option( $option ) ) {
+	if ( ! cs_is_previewable_option( $option ) ) {
 		return $pre;
 	}
 	$index = cs_preview_staged_index();
@@ -1491,6 +1541,9 @@ function cs_preview_filter_option( $pre, $option ) {
  * @return mixed
  */
 function cs_preview_filter_theme_mod( $pre, $name ) {
+	if ( ! cs_is_previewable_option( $name, 'theme_mod' ) ) {
+		return $pre;
+	}
 	$index = cs_preview_staged_index();
 	if ( ! $index ) {
 		return $pre;
@@ -1536,6 +1589,7 @@ function cs_preview_global_styles( $theme_json ) {
 		$payload = $resolved['data'];
 	}
 
+	$payload = cs_sanitize_global_styles( $payload );
 	$payload['isGlobalStylesUserThemeJSON'] = true;
 	if ( empty( $payload['version'] ) ) {
 		$payload['version'] = 3;
@@ -1679,10 +1733,15 @@ function cs_get_status() {
 		'open_changeset_count' => 0,
 	);
 
-	// Count open changesets.
+	if ( ! cs_user_can_manage_changesets() ) {
+		return $status;
+	}
+
+	// Count visible open changesets.
 	$open = get_posts(
 		array(
 			'post_type'      => 'changeset',
+			'author'         => current_user_can( 'manage_changesets' ) ? 0 : get_current_user_id(),
 			'post_status'    => 'draft',
 			'posts_per_page' => 1,
 			'meta_query'     => array(
@@ -1737,6 +1796,14 @@ function cs_user_can_publish_changeset( $changeset_id ) {
 
 /** Whether a setting is safe to stage, preview, or publish. */
 function cs_is_safe_staged_option( $key, $store = 'option' ) {
+	global $wpdb;
+	if ( is_string( $key ) && 0 === strpos( strtolower( trim( $key ) ), '_changeset_publish_lock_' ) ) {
+		return false;
+	}
+	if ( ! is_string( $key ) || ! preg_match( '/^[\x21-\x7e]+$/D', $key ) || trim( $key ) !== $key ) {
+		return false;
+	}
+	$key = strtolower( $key );
 	// Denylist: unsafe keys that affect bootstrap, authentication, or core behavior.
 	$denylisted_options = array(
 		// Registration and authorization must never be previewed.
@@ -1744,6 +1811,8 @@ function cs_is_safe_staged_option( $key, $store = 'option' ) {
 		'default_role',
 		'admin_email',
 		'new_admin_email',
+		$wpdb->prefix . 'user_roles',
+		'cron',
 		// Plugin management.
 		'active_plugins',
 		'uninstall_plugins',
@@ -1771,19 +1840,20 @@ function cs_is_safe_staged_option( $key, $store = 'option' ) {
 	 */
 	$denylisted_options = apply_filters( 'cs_denylisted_options', $denylisted_options, $key, $store );
 
-	return 'theme_mod' === $store || ( 'option' === $store && ! in_array( $key, $denylisted_options, true ) );
+	return 'theme_mod' === $store || ( 'option' === $store && ! in_array( $key, array_map( 'strtolower', $denylisted_options ), true ) );
 }
 
 
 /** Revoke approval whenever staged payloads change, including native editor saves. */
 function cs_invalidate_approval( $changeset_id ) {
 	global $cs_publishing_changeset;
-	if ( $cs_publishing_changeset || ! cs_is_changeset_approved( $changeset_id ) ) {
+	if ( (int) $cs_publishing_changeset === (int) $changeset_id || ! cs_is_changeset_approved( $changeset_id ) ) {
 		return;
 	}
 	update_post_meta( $changeset_id, '_changeset_status', 'open' );
 	delete_post_meta( $changeset_id, '_changeset_approved_by' );
 	delete_post_meta( $changeset_id, '_changeset_approved_at' );
+	delete_post_meta( $changeset_id, '_changeset_approved_hash' );
 }
 
 function cs_invalidate_approval_on_meta( $meta_id, $post_id, $key, $value ) {
@@ -1854,3 +1924,129 @@ function cs_invalidate_approval_on_terms( $post_id, $terms, $tt_ids, $taxonomy, 
 }
 add_action( 'set_object_terms', 'cs_invalidate_approval_on_terms', 10, 6 );
 add_action( 'deleted_term_relationships', 'cs_invalidate_approval_on_delete' );
+
+/** Extract custom CSS before core sanitization, which otherwise trusts edit_css. */
+function cs_extract_style_css( $data, &$entries, $path = array() ) {
+	if ( ! is_array( $data ) ) {
+		return;
+	}
+	foreach ( $data as $key => $value ) {
+		$child = array_merge( $path, array( $key ) );
+		if ( 'css' === $key ) {
+			$entries[] = array( 'path' => $child, 'value' => $value );
+		} elseif ( is_array( $value ) ) {
+			cs_extract_style_css( $value, $entries, $child );
+		}
+	}
+}
+function cs_remove_style_css( $data ) {
+	foreach ( $data as $key => $value ) {
+		if ( 'css' === $key ) {
+			unset( $data[ $key ] );
+		} elseif ( is_array( $value ) ) {
+			$data[ $key ] = cs_remove_style_css( $value );
+		}
+	}
+	return $data;
+}
+function cs_sanitize_global_styles( $data ) {
+	$css = array();
+	cs_extract_style_css( $data, $css );
+	$safe = WP_Theme_JSON::remove_insecure_properties( cs_remove_style_css( $data ), 'custom' );
+	foreach ( $css as $entry ) {
+		if ( is_string( $entry['value'] ) && ! preg_match( '#</?\w+#', $entry['value'] ) ) {
+			_wp_array_set( $safe, $entry['path'], $entry['value'] );
+		}
+	}
+	return $safe;
+}
+
+/** Capture every field publication uses before touching live state. */
+function cs_get_changeset_payload( $changeset_id ) {
+	$payload = array( 'posts' => array(), 'sources' => array(), 'thumbnails' => array(), 'terms' => array(), 'options' => cs_get_staged_options( $changeset_id ), 'styles' => cs_get_staged_global_styles( $changeset_id ) );
+	$ids = cs_get_staged_drafts( $changeset_id );
+	sort( $ids, SORT_NUMERIC );
+	foreach ( $ids as $id ) {
+		$post = get_post( $id );
+		if ( ! $post ) {
+			continue;
+		}
+		$payload['posts'][ $id ] = clone $post;
+		$payload['sources'][ $id ] = cs_get_staged_source_id( $id );
+		$payload['thumbnails'][ $id ] = get_post_thumbnail_id( $id );
+		$payload['terms'][ $id ] = array();
+		foreach ( array( 'category', 'post_tag' ) as $taxonomy ) {
+			if ( is_object_in_taxonomy( $post->post_type, $taxonomy ) ) {
+				$terms = wp_get_object_terms( $id, $taxonomy, array( 'fields' => 'ids' ) );
+				if ( ! is_wp_error( $terms ) ) {
+					sort( $terms, SORT_NUMERIC );
+					$payload['terms'][ $id ][ $taxonomy ] = $terms;
+				}
+			}
+		}
+	}
+	if ( ! $payload['styles'] ) {
+		$variation = cs_get_staged_style_variation( $changeset_id );
+		if ( $variation ) {
+			$resolved = cs_resolve_style_variation( $variation );
+			if ( ! is_wp_error( $resolved ) ) {
+				$payload['styles'] = $resolved['data'];
+			}
+		}
+	}
+	return $payload;
+}
+function cs_payload_hash( $payload ) {
+	return hash( 'sha256', serialize( $payload ) );
+}
+
+/** Publication locks are local to a changeset and released on every normal exit. */
+function cs_changeset_is_publishing( $changeset_id ) {
+	global $cs_publishing_changeset;
+	return (int) $cs_publishing_changeset !== (int) $changeset_id && (bool) get_option( '_changeset_publish_lock_' . (int) $changeset_id, false );
+}
+function cs_block_publishing_post_update( $maybe_empty, $postarr ) {
+	$id = isset( $postarr['ID'] ) ? (int) $postarr['ID'] : 0;
+	return $maybe_empty || ( $id && cs_is_staged( $id ) && cs_changeset_is_publishing( cs_get_staged_changeset_id( $id ) ) );
+}
+add_filter( 'wp_insert_post_empty_content', 'cs_block_publishing_post_update', 10, 2 );
+function cs_block_publishing_meta_update( $check, $post_id, $key ) {
+	$id = cs_is_staged( $post_id ) ? cs_get_staged_changeset_id( $post_id ) : ( get_post_type( $post_id ) === 'changeset' ? $post_id : 0 );
+	if ( $id && cs_changeset_is_publishing( $id ) ) {
+		return false;
+	}
+	return $check;
+}
+add_filter( 'add_post_metadata', 'cs_block_publishing_meta_update', 10, 3 );
+add_filter( 'update_post_metadata', 'cs_block_publishing_meta_update', 10, 3 );
+add_filter( 'delete_post_metadata', 'cs_block_publishing_meta_update', 10, 3 );
+
+function cs_block_publishing_post_delete( $check, $post ) {
+	$id = cs_is_staged( $post->ID ) ? cs_get_staged_changeset_id( $post->ID ) : ( 'changeset' === $post->post_type ? $post->ID : 0 );
+	return $id && cs_changeset_is_publishing( $id ) ? false : $check;
+}
+add_filter( 'pre_delete_post', 'cs_block_publishing_post_delete', 10, 2 );
+add_filter( 'pre_trash_post', 'cs_block_publishing_post_delete', 10, 2 );
+
+/** Public previews overlay presentation settings, never arbitrary plugin behavior. */
+function cs_is_previewable_option( $key, $store = 'option' ) {
+	if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+		return false;
+	}
+	$keys = 'theme_mod' === $store
+		? array( 'custom_logo', 'nav_menu_locations', 'header_textcolor', 'header_image', 'background_color', 'background_image', 'background_repeat', 'background_position_x', 'background_attachment' )
+		: array( 'blogname', 'blogdescription', 'show_on_front', 'page_on_front', 'page_for_posts', 'site_icon', 'posts_per_page', 'posts_per_rss', 'rss_use_excerpt', 'date_format', 'time_format', 'start_of_week', 'timezone_string', 'gmt_offset', 'thumbnail_size_w', 'thumbnail_size_h', 'thumbnail_crop', 'medium_size_w', 'medium_size_h', 'large_size_w', 'large_size_h' );
+	$keys = apply_filters( 'cs_previewable_options', $keys, $store );
+	return in_array( $key, $keys, true );
+}
+
+/** Prevent native editors from ever writing an unapproved staged publish status. */
+function cs_guard_staged_post_status( $data, $postarr ) {
+	global $cs_publishing_changeset;
+	$id = isset( $postarr['ID'] ) ? (int) $postarr['ID'] : 0;
+	if ( $id && 'publish' === $data['post_status'] && cs_is_staged( $id ) && ( ! $cs_publishing_changeset || (int) $cs_publishing_changeset !== cs_get_staged_changeset_id( $id ) ) ) {
+		$data['post_status'] = 'draft';
+	}
+	return $data;
+}
+add_filter( 'wp_insert_post_data', 'cs_guard_staged_post_status', PHP_INT_MAX, 2 );
