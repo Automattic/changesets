@@ -520,6 +520,10 @@ function cs_ability_can_save( $input ) {
 	$type      = isset( $input['type'] ) ? $input['type'] : '';
 	$source_id = isset( $input['source_id'] ) ? (int) $input['source_id'] : 0;
 
+	if ( 'setting' === $type && ! current_user_can( 'manage_options' ) ) {
+		return false;
+	}
+
 	if ( 'content' === $type && $source_id && ! current_user_can( 'edit_post', $source_id ) ) {
 		return false;
 	}

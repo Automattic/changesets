@@ -243,6 +243,10 @@ function cs_approve_changeset( $changeset_id ) {
 		return new WP_Error( 'cs_forbidden', __( 'You cannot approve this changeset.', 'changesets' ) );
 	}
 
+	if ( ! in_array( cs_get_changeset_status( $changeset_id ), array( 'open', 'approved' ), true ) ) {
+		return new WP_Error( 'cs_closed_changeset', __( 'Cannot approve a closed changeset.', 'changesets' ) );
+	}
+
 	update_post_meta( $changeset_id, '_changeset_status', 'approved' );
 	update_post_meta( $changeset_id, '_changeset_approved_by', get_current_user_id() );
 	update_post_meta( $changeset_id, '_changeset_approved_at', gmdate( 'c' ) );
@@ -396,6 +400,9 @@ function cs_get_staged_options( $changeset_id ) {
  * @return true|WP_Error
  */
 function cs_stage_option( $changeset_id, $key, $value, $store = 'option' ) {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return new WP_Error( 'cs_forbidden', __( 'You cannot stage settings.', 'changesets' ) );
+	}
 	$changeset = cs_get_changeset( $changeset_id );
 	if ( ! $changeset ) {
 		return new WP_Error( 'cs_invalid_changeset', __( 'Invalid changeset.', 'changesets' ) );
@@ -410,44 +417,8 @@ function cs_stage_option( $changeset_id, $key, $value, $store = 'option' ) {
 		$store = 'theme_mod';
 	}
 
-	// Denylist: unsafe keys that affect bootstrap, authentication, or core behavior.
-	$denylisted_options = array(
-		// Plugin management.
-		'active_plugins',
-		'uninstall_plugins',
-		// Theme switching.
-		'template',
-		'stylesheet',
-		'current_theme',
-		'theme_switched',
-		// Site URLs (change request context).
-		'siteurl',
-		'home',
-		// Permalinks and rewrites (change routing/bootstrap).
-		'permalink_structure',
-		'rewrite_rules',
-		'category_base',
-		'tag_base',
-	);
-
-	/**
-	 * Filter the denylist of options that cannot be staged.
-	 *
-	 * @param array  $denylisted_options Unsafe option keys.
-	 * @param string $key                The option key being staged.
-	 * @param string $store              Storage type ('option' or 'theme_mod').
-	 */
-	$denylisted_options = apply_filters( 'cs_denylisted_options', $denylisted_options, $key, $store );
-
-	if ( 'option' === $store && in_array( $key, $denylisted_options, true ) ) {
-		return new WP_Error(
-			'cs_denylisted_option',
-			sprintf(
-				/* translators: %s: option key */
-				__( 'Option "%s" cannot be staged (affects site bootstrap or security).', 'changesets' ),
-				$key
-			)
-		);
+	if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+		return new WP_Error( 'cs_denylisted_option', __( 'This option cannot be staged.', 'changesets' ) );
 	}
 
 	// Type conversion for known post/attachment reference keys.
@@ -844,6 +815,23 @@ function cs_publish_changeset( $changeset_id ) {
 		return new WP_Error( 'cs_not_changeset', __( 'Not a changeset.', 'changesets' ) );
 	}
 
+	if ( ! cs_user_can_publish_changeset( $changeset_id ) ) {
+		return new WP_Error( 'cs_forbidden', __( 'You cannot publish this changeset.', 'changesets' ) );
+	}
+	if ( ! cs_is_changeset_approved( $changeset_id ) ) {
+		return new WP_Error( 'cs_not_approved', __( 'Approve the changeset before publishing.', 'changesets' ) );
+	}
+	$options = cs_get_staged_options( $changeset_id );
+	if ( $options && ! current_user_can( 'manage_options' ) ) {
+		return new WP_Error( 'cs_forbidden', __( 'You cannot publish settings.', 'changesets' ) );
+	}
+	foreach ( $options as $key => $item ) {
+		$store = is_array( $item ) && isset( $item['store'] ) ? $item['store'] : 'option';
+		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+			return new WP_Error( 'cs_denylisted_option', __( 'This changeset contains an unsafe option.', 'changesets' ) );
+		}
+	}
+
 	// Set internal flag to bypass staged-publish guard during this operation.
 	$cs_publishing_changeset = true;
 
@@ -957,9 +945,6 @@ function cs_publish_changeset( $changeset_id ) {
 		}
 	}
 
-	// Clear internal flag.
-	$cs_publishing_changeset = false;
-
 	// Apply settings with ID remapping AFTER content is published.
 	$options = cs_get_staged_options( $changeset_id );
 	if ( $options ) {
@@ -1023,6 +1008,7 @@ function cs_publish_changeset( $changeset_id ) {
 	update_post_meta( $changeset_id, '_changeset_status', 'published' );
 	update_post_meta( $changeset_id, '_changeset_published_at', gmdate( 'c' ) );
 	update_post_meta( $changeset_id, '_changeset_published_by', get_current_user_id() );
+	$cs_publishing_changeset = false;
 
 	cs_clear_preview_cookie();
 
@@ -1221,13 +1207,14 @@ function cs_clear_preview_cookie() {
  * @return string|null
  */
 function cs_get_active_preview_uuid() {
-	if ( isset( $_GET['changeset'] ) && $_GET['changeset'] ) {
-		return sanitize_text_field( wp_unslash( $_GET['changeset'] ) );
+	$token = isset( $_GET['changeset'] ) ? $_GET['changeset'] : ( isset( $_COOKIE['changeset'] ) ? $_COOKIE['changeset'] : null );
+	if ( ! is_string( $token ) || ! preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iD', $token ) ) {
+		return null;
 	}
-	if ( isset( $_COOKIE['changeset'] ) && $_COOKIE['changeset'] ) {
-		return sanitize_text_field( wp_unslash( $_COOKIE['changeset'] ) );
+	if ( defined( 'CHANGESETS_PRIVATE_PREVIEWS' ) && CHANGESETS_PRIVATE_PREVIEWS && ! current_user_can( 'manage_changesets' ) ) {
+		return null;
 	}
-	return null;
+	return $token;
 }
 
 /**
@@ -1246,7 +1233,7 @@ function cs_init_preview() {
 		return;
 	}
 
-	$changeset = cs_get_changeset( $uuid );
+	$changeset = cs_get_preview_changeset( $uuid );
 	if ( ! $changeset ) {
 		cs_clear_preview_cookie();
 		return;
@@ -1297,7 +1284,7 @@ function cs_preview_staged_index() {
 		return null;
 	}
 
-	$changeset = cs_get_changeset( $uuid );
+	$changeset = cs_get_preview_changeset( $uuid );
 	if ( ! $changeset ) {
 		return null;
 	}
@@ -1442,7 +1429,7 @@ function cs_preview_init_dynamic_filters() {
 		return;
 	}
 
-	$changeset = cs_get_changeset( $uuid );
+	$changeset = cs_get_preview_changeset( $uuid );
 	if ( ! $changeset ) {
 		return;
 	}
@@ -1453,6 +1440,10 @@ function cs_preview_init_dynamic_filters() {
 	}
 
 	foreach ( $bag as $key => $item ) {
+		$store = is_array( $item ) && isset( $item['store'] ) ? $item['store'] : 'option';
+		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
+			continue;
+		}
 		// Backward compatibility: 0.5.0+ structure { value, store } vs 0.4.2 direct value.
 		if ( is_array( $item ) && isset( $item['store'] ) && 'theme_mod' === $item['store'] ) {
 			// Theme mod: hook pre_theme_mod_{$key}.
@@ -1473,6 +1464,9 @@ add_action( 'init', 'cs_preview_init_dynamic_filters', 20 );
  * @return mixed
  */
 function cs_preview_filter_option( $pre, $option ) {
+	if ( ! cs_is_safe_staged_option( $option ) ) {
+		return $pre;
+	}
 	$index = cs_preview_staged_index();
 	if ( ! $index ) {
 		return $pre;
@@ -1523,7 +1517,7 @@ function cs_preview_global_styles( $theme_json ) {
 	if ( ! $uuid ) {
 		return $theme_json;
 	}
-	$changeset = cs_get_changeset( $uuid );
+	$changeset = cs_get_preview_changeset( $uuid );
 	if ( ! $changeset || ! class_exists( 'WP_Theme_JSON_Data' ) ) {
 		return $theme_json;
 	}
@@ -1728,7 +1722,7 @@ add_action( 'before_delete_post', 'cs_delete_changeset_staged', 10, 2 );
  * @return bool
  */
 function cs_user_can_approve_changeset( $changeset_id ) {
-	return current_user_can( 'approve_changesets' ) || current_user_can( 'publish_posts' ) || current_user_can( 'publish_pages' );
+	return current_user_can( 'approve_changesets' ) && ( ! cs_get_staged_options( $changeset_id ) || current_user_can( 'manage_options' ) );
 }
 
 /**
@@ -1738,5 +1732,96 @@ function cs_user_can_approve_changeset( $changeset_id ) {
  * @return bool
  */
 function cs_user_can_publish_changeset( $changeset_id ) {
-	return current_user_can( 'publish_changesets' ) || current_user_can( 'publish_posts' ) || current_user_can( 'publish_pages' );
+	return current_user_can( 'publish_changesets' );
+}
+
+/** Whether a setting is safe to stage, preview, or publish. */
+function cs_is_safe_staged_option( $key, $store = 'option' ) {
+	// Denylist: unsafe keys that affect bootstrap, authentication, or core behavior.
+	$denylisted_options = array(
+		// Registration and authorization must never be previewed.
+		'users_can_register',
+		'default_role',
+		'admin_email',
+		'new_admin_email',
+		// Plugin management.
+		'active_plugins',
+		'uninstall_plugins',
+		// Theme switching.
+		'template',
+		'stylesheet',
+		'current_theme',
+		'theme_switched',
+		// Site URLs (change request context).
+		'siteurl',
+		'home',
+		// Permalinks and rewrites (change routing/bootstrap).
+		'permalink_structure',
+		'rewrite_rules',
+		'category_base',
+		'tag_base',
+	);
+
+	/**
+	 * Filter the denylist of options that cannot be staged.
+	 *
+	 * @param array  $denylisted_options Unsafe option keys.
+	 * @param string $key                The option key being staged.
+	 * @param string $store              Storage type ('option' or 'theme_mod').
+	 */
+	$denylisted_options = apply_filters( 'cs_denylisted_options', $denylisted_options, $key, $store );
+
+	return 'option' !== $store || ! in_array( $key, $denylisted_options, true );
+}
+
+
+/** Revoke approval whenever staged payloads change, including native editor saves. */
+function cs_invalidate_approval( $changeset_id ) {
+	global $cs_publishing_changeset;
+	if ( $cs_publishing_changeset || ! cs_is_changeset_approved( $changeset_id ) ) {
+		return;
+	}
+	update_post_meta( $changeset_id, '_changeset_status', 'open' );
+	delete_post_meta( $changeset_id, '_changeset_approved_by' );
+	delete_post_meta( $changeset_id, '_changeset_approved_at' );
+}
+
+function cs_invalidate_approval_on_meta( $meta_id, $post_id, $key, $value ) {
+	if ( '_changeset_id' === $key ) {
+		cs_invalidate_approval( (int) $value );
+	}
+	if ( in_array( $key, array( '_changeset_staged_options', '_changeset_staged_global_styles', '_changeset_staged_style_variation', '_changeset_staged_style_variation_title' ), true ) ) {
+		cs_invalidate_approval( $post_id );
+	} elseif ( '_changeset_is_staged' === $key || cs_is_staged( $post_id ) ) {
+		cs_invalidate_approval( cs_get_staged_changeset_id( $post_id ) );
+	}
+}
+add_action( 'added_post_meta', 'cs_invalidate_approval_on_meta', 10, 4 );
+add_action( 'updated_post_meta', 'cs_invalidate_approval_on_meta', 10, 4 );
+add_action( 'deleted_post_meta', 'cs_invalidate_approval_on_meta', 10, 4 );
+
+function cs_invalidate_approval_on_post( $post_id, $post_after, $post_before ) {
+	if ( cs_is_staged( $post_id ) && $post_after != $post_before ) {
+		cs_invalidate_approval( cs_get_staged_changeset_id( $post_id ) );
+	}
+}
+add_action( 'post_updated', 'cs_invalidate_approval_on_post', 10, 3 );
+
+function cs_invalidate_approval_on_delete( $post_id ) {
+	if ( cs_is_staged( $post_id ) ) {
+		cs_invalidate_approval( cs_get_staged_changeset_id( $post_id ) );
+	}
+}
+add_action( 'before_delete_post', 'cs_invalidate_approval_on_delete' );
+
+/** Public preview resolution never accepts the internal numeric identifier. */
+function cs_get_preview_changeset( $uuid ) {
+	if ( ! is_string( $uuid ) || ! preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iD', $uuid ) ) {
+		return null;
+	}
+	$changeset = cs_get_changeset( $uuid );
+	if ( ! $changeset || ! in_array( cs_get_changeset_status( $changeset->ID ), array( 'open', 'approved' ), true ) ) {
+		return null;
+	}
+	return $changeset;
 }
