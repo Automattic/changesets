@@ -8,6 +8,11 @@ wp-env start
 wp-env run tests-cli wp plugin activate changesets
 wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-regressions.php
 wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-regressions.php private
+wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-review-regressions.php
+# Each gets a fresh request to exercise the staged-content index:
+for token in numeric cookie array unknown; do
+  wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-review-regressions.php invalid-preview "$token"
+done
 ```
 
 The standard pass covers Contributor/Author proposal permissions, approval/publish
@@ -22,3 +27,6 @@ plugin functions and WordPress hooks, not a reproduction of the complete origina
 HackerOne payloads, HTTP registration flow, MCP transport or the other reported
 WordPress/PHP versions. The source MCP Adapter archive emits a missing Composer
 autoloader notice; these checks call Changesets functions directly.
+
+Final-review checks cover malformed legacy storage bags, native taxonomy changes,
+staged membership reassignment and public content/UI alias paths.

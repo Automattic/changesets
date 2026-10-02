@@ -826,7 +826,7 @@ function cs_publish_changeset( $changeset_id ) {
 		return new WP_Error( 'cs_forbidden', __( 'You cannot publish settings.', 'changesets' ) );
 	}
 	foreach ( $options as $key => $item ) {
-		$store = is_array( $item ) && isset( $item['store'] ) ? $item['store'] : 'option';
+		$store = cs_get_staged_option_store( $item );
 		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
 			return new WP_Error( 'cs_denylisted_option', __( 'This changeset contains an unsafe option.', 'changesets' ) );
 		}
@@ -952,7 +952,7 @@ function cs_publish_changeset( $changeset_id ) {
 			// Backward compatibility: direct values (0.4.2) vs new structure (0.5.0+).
 			if ( is_array( $item ) && isset( $item['value'] ) ) {
 				$value = $item['value'];
-				$store = isset( $item['store'] ) ? $item['store'] : 'option';
+				$store = cs_get_staged_option_store( $item );
 			} else {
 				// Old format: direct value, assume option store.
 				$value = $item;
@@ -1440,12 +1440,12 @@ function cs_preview_init_dynamic_filters() {
 	}
 
 	foreach ( $bag as $key => $item ) {
-		$store = is_array( $item ) && isset( $item['store'] ) ? $item['store'] : 'option';
+		$store = cs_get_staged_option_store( $item );
 		if ( ! cs_is_safe_staged_option( $key, $store ) ) {
 			continue;
 		}
 		// Backward compatibility: 0.5.0+ structure { value, store } vs 0.4.2 direct value.
-		if ( is_array( $item ) && isset( $item['store'] ) && 'theme_mod' === $item['store'] ) {
+		if ( 'theme_mod' === $store ) {
 			// Theme mod: hook pre_theme_mod_{$key}.
 			add_filter( "pre_theme_mod_{$key}", 'cs_preview_filter_theme_mod', 10, 2 );
 		} else {
@@ -1771,7 +1771,7 @@ function cs_is_safe_staged_option( $key, $store = 'option' ) {
 	 */
 	$denylisted_options = apply_filters( 'cs_denylisted_options', $denylisted_options, $key, $store );
 
-	return 'option' !== $store || ! in_array( $key, $denylisted_options, true );
+	return 'theme_mod' === $store || ( 'option' === $store && ! in_array( $key, $denylisted_options, true ) );
 }
 
 
@@ -1825,3 +1825,32 @@ function cs_get_preview_changeset( $uuid ) {
 	}
 	return $changeset;
 }
+
+/** Interpret legacy and structured bags identically at every application boundary. */
+function cs_get_staged_option_store( $item ) {
+	if ( is_array( $item ) && array_key_exists( 'store', $item ) ) {
+		// A storage declaration without a value is not a legacy direct value.
+		return isset( $item['value'] ) ? $item['store'] : null;
+	}
+	return 'option';
+}
+
+/** Capture the old association before WordPress replaces its metadata. */
+function cs_invalidate_approval_before_meta_update( $meta_id, $post_id, $key, $value ) {
+	if ( '_changeset_id' === $key ) {
+		$old_id = cs_get_staged_changeset_id( $post_id );
+		if ( $old_id !== (int) $value ) {
+			cs_invalidate_approval( $old_id );
+		}
+	}
+}
+add_action( 'update_post_meta', 'cs_invalidate_approval_before_meta_update', 10, 4 );
+
+/** Native taxonomy changes are part of the payload copied during publication. */
+function cs_invalidate_approval_on_terms( $post_id, $terms, $tt_ids, $taxonomy, $append, $old_tt_ids ) {
+	if ( cs_is_staged( $post_id ) && ( array_diff( $tt_ids, $old_tt_ids ) || array_diff( $old_tt_ids, $tt_ids ) ) ) {
+		cs_invalidate_approval( cs_get_staged_changeset_id( $post_id ) );
+	}
+}
+add_action( 'set_object_terms', 'cs_invalidate_approval_on_terms', 10, 6 );
+add_action( 'deleted_term_relationships', 'cs_invalidate_approval_on_delete' );

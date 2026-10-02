@@ -18,7 +18,7 @@ function cs_render_changeset_bar() {
 		return;
 	}
 
-	$changeset = cs_get_changeset( $uuid );
+	$changeset = cs_get_preview_changeset( $uuid );
 	if ( ! $changeset ) {
 		return;
 	}
@@ -234,7 +234,7 @@ add_action( 'admin_enqueue_scripts', 'cs_disable_changeset_quick_edit' );
  * @return array
  */
 function cs_previewing_admin_body_class( $classes ) {
-	if ( cs_get_active_preview_uuid() && cs_get_changeset( cs_get_active_preview_uuid() ) ) {
+	if ( cs_get_active_preview_uuid() && cs_get_preview_changeset( cs_get_active_preview_uuid() ) ) {
 		$classes[] = 'dcp-previewing';
 	}
 	return $classes;
