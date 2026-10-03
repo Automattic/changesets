@@ -463,7 +463,7 @@ function cs_ability_create_changeset( $input ) {
 }
 
 function cs_ability_can_get_changeset( $input ) {
-	return cs_user_can_manage_changesets();
+	return cs_user_can_access_changeset( isset( $input['changeset_id'] ) ? (int) $input['changeset_id'] : 0 );
 }
 
 function cs_ability_get_changeset( $input ) {
@@ -517,8 +517,18 @@ function cs_ability_list_changesets( $input ) {
 }
 
 function cs_ability_can_save( $input ) {
+	if ( isset( $input['changeset_id'] ) && cs_changeset_is_publishing( (int) $input['changeset_id'] ) ) {
+		return false;
+	}
+	if ( ! cs_user_can_access_changeset( isset( $input['changeset_id'] ) ? (int) $input['changeset_id'] : 0 ) ) {
+		return false;
+	}
 	$type      = isset( $input['type'] ) ? $input['type'] : '';
 	$source_id = isset( $input['source_id'] ) ? (int) $input['source_id'] : 0;
+
+	if ( 'setting' === $type && ! current_user_can( 'manage_options' ) ) {
+		return false;
+	}
 
 	if ( 'content' === $type && $source_id && ! current_user_can( 'edit_post', $source_id ) ) {
 		return false;
@@ -562,8 +572,8 @@ function cs_ability_save( $input ) {
  * @return array|WP_Error
  */
 function cs_ability_save_content( $changeset_id, $input ) {
-	$post_type = isset( $input['post_type'] ) ? $input['post_type'] : 'page';
 	$source_id = isset( $input['source_id'] ) ? (int) $input['source_id'] : 0;
+	$post_type = isset( $input['post_type'] ) ? $input['post_type'] : ( $source_id ? get_post_type( $source_id ) : 'page' );
 
 	// Validate post type.
 	if ( ! cs_is_stageable_post_type( $post_type ) ) {
@@ -658,7 +668,7 @@ function cs_ability_save_content( $changeset_id, $input ) {
 		'post_type'    => $post_type,
 		'title'        => $staged->post_title,
 		'slug'         => $staged->post_name,
-		'edit_url'     => get_edit_post_link( $staged_id, 'raw' ),
+		'edit_url'     => (string) get_edit_post_link( $staged_id, 'raw' ),
 		'preview_path' => $preview_path,
 	);
 }
@@ -791,7 +801,10 @@ function cs_ability_publish_changeset( $input ) {
 }
 
 function cs_ability_can_discard_changeset( $input ) {
-	return cs_user_can_manage_changesets();
+	if ( isset( $input['changeset_id'] ) && cs_changeset_is_publishing( (int) $input['changeset_id'] ) ) {
+		return false;
+	}
+	return cs_user_can_access_changeset( isset( $input['changeset_id'] ) ? (int) $input['changeset_id'] : 0 );
 }
 
 function cs_ability_discard_changeset( $input ) {
@@ -806,4 +819,10 @@ function cs_ability_discard_changeset( $input ) {
 
 function cs_ability_get_status( $input ) {
 	return cs_get_status();
+}
+
+/** Propose-only users operate on their own sessions; managers can collaborate. */
+function cs_user_can_access_changeset( $changeset_id ) {
+	$changeset = cs_get_changeset( $changeset_id );
+	return $changeset && cs_user_can_manage_changesets() && ( current_user_can( 'manage_changesets' ) || (int) $changeset->post_author === get_current_user_id() );
 }
