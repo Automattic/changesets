@@ -1,81 +1,57 @@
-# Local security regression checks
+# Security regressions
 
-Run only against a disposable localhost WordPress installation. Tests create role
-accounts, temporary application passwords, changesets and content, and publish test
-content. They are not a production diagnostic tool. PHP tests require WP-CLI;
-HTTP tests use Python 3.8+ standard libraries and need no browser.
+Use a disposable localhost WordPress installation with WP-CLI and Python 3.9+.
+These tests create accounts and publish test content. The PHP suite removes its
+created records on exit; the HTTP fixture has an explicit cleanup command.
 
-## Function and WordPress-hook tests
+## Integration tests
 
 ```sh
 wp-env start
-wp-env run tests-cli wp plugin activate changesets
 wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-regressions.php
 wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-regressions.php private
-wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-review-regressions.php
-wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/plugin-security-regressions.php
 for token in numeric cookie array unknown; do
-  wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-review-regressions.php invalid-preview "$token"
+  wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/security-regressions.php invalid-preview "$token"
 done
 ```
 
-Each invalid-preview invocation is a fresh request because preview content uses
-per-request caching. Checks cover privilege and ownership boundaries, unsafe and
-malformed legacy options, name aliases, approval mutations, source-type inference,
-CSS sanitization, immutable publication snapshots and publication locks.
+Covers permissions, legacy settings, approval mutations, fingerprints, immutable
+publication, CSS and preview identifiers. Preview modes run in fresh processes.
+Leave `CHANGESETS_PRIVATE_PREVIEWS` undefined for these commands.
 
-## Actual HTTP and MCP tests
+## HTTP/MCP and concurrent requests
 
-Use a built MCP Adapter, not its source archive without dependencies. The local
-validation copied the official source to `.local/mcp-adapter` and installed its
-production Composer dependencies (`composer install --no-dev`). An ignored
-`.wp-env.override.json` mapped this copy instead of the source archive and selected
-unused development/test ports 8898/8899. The plugin's existing `meta.public` flags
-worked with the standard Adapter 0.7.0; no custom exposure configuration was used.
+Build the MCP Adapter (`composer install --no-dev` in its checkout), then map
+that checkout and the barrier in a local override. For example, if the Adapter
+is in `.local/mcp-adapter`, `.wp-env.override.json` can contain:
 
-```sh
-mkdir -p .local
-wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/http-fixture.php
-python3 tests/http-regressions.py --fixture .local/http-fixture-secrets.php
+```json
+{"plugins":[".","./.local/mcp-adapter","./tests/fixtures/concurrency-barrier"],"port":8898,"testsPort":8899}
 ```
 
-Fixture secrets are saved in an excluded PHP file that exits when requested over
-HTTP. Never commit them. The suite covers actual REST abilities, MCP calls,
-query/cookie previews, registration pages, native draft REST endpoints, native
-admin lists, cookie authentication without a REST nonce, and a complete
-Contributor proposal → Editor review → mutation → reapproval → publish workflow.
-Script injection payloads contain inert markers and are inspected as response text;
-no script is executed.
-
-For concurrent requests, add `tests/fixtures/concurrency-barrier` as a plugin in
-the **local override only**, and activate it. It pauses local publication for 1.5s
-after snapshot capture; the test sends separate HTTP requests during that window.
+Restart wp-env after changing the override. Pass `--base` if the test port differs.
+The barrier is a localhost-only plugin that pauses publication for race tests.
 
 ```sh
+wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/http-fixture.php
+python3 tests/http-regressions.py --fixture .local/http-fixture-secrets.php
 wp-env run tests-cli wp plugin activate concurrency-barrier
 python3 tests/concurrency-http-regressions.py --fixture .local/http-fixture-secrets.php
 wp-env run tests-cli wp plugin deactivate concurrency-barrier
 ```
 
-The implementation run used the same barrier copied to an excluded local test
-plugin. Checks cover both staged items, native deletion, ability mutation,
-duplicate publishing, concurrent reapproval and the public content result.
-
-For private HTTP checks, temporarily set `CHANGESETS_PRIVATE_PREVIEWS: true` in
-the local wp-env override `config`, restart, and run:
+For private HTTP checks, set `CHANGESETS_PRIVATE_PREVIEWS: true` in the local
+override config, restart wp-env, and run the HTTP command with `--private`.
+Restore public mode afterward. Always clean up, including after a failed test:
 
 ```sh
-python3 tests/private-http-regressions.py --fixture .local/http-fixture-secrets.php
+wp-env run tests-cli wp eval-file wp-content/plugins/changesets/tests/http-fixture.php cleanup
+wp-env stop
 ```
 
-Restore public mode afterward. Delete fixture accounts (which revokes their
-application passwords), remove the secrets file, deactivate the barrier and stop
-the disposable environment when finished.
+Fixture credentials are stored in `.local/`, ignored by Git, and protected from
+HTTP reads. Cleanup revokes application passwords and restores registration
+options. Tests inspect inert script markers; they do not execute scripts.
 
-## Validation limits
-
-The suite was exercised on WordPress 6.9/PHP 8.2.34 and the reported WordPress
-6.9.4 and 7.1.2/PHP 8.3.35 combinations. These tests reproduce the reported
-privilege/registration/identifier/approval scenarios, rather than the complete
-unavailable HackerOne payloads. They do not certify every third-party plugin,
-multisite configuration, distributed cache or arbitrary process failure.
+Validated with WordPress 6.9/PHP 8.2 and 6.9.4/7.1.2/PHP 8.3, MCP Adapter 0.7.0.
+These regressions do not cover every integration, multisite or worker failure.

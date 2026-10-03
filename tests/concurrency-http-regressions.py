@@ -1,7 +1,8 @@
 """True concurrent localhost HTTP checks; requires the disposable publication barrier plugin."""
 import sys, threading, time
 from pathlib import Path
-exec(Path(__file__).with_name('http-regressions.py').read_text().split("s,b=ability('create',None")[0])
+from http_helpers import args, check, request, ability, finish
+import json
 barrier=Path(args.fixture).parent/'publish-barrier';barrier.unlink(missing_ok=True)
 s,b=ability('create','contributor',{'title':'Concurrent HTTP proposal'});check(s==200,'Concurrent fixture created');cs=b['changeset_id']
 posts=[]
@@ -25,4 +26,4 @@ s,b=ability('approve','editor',{'changeset_id':cs});check(b.get('code')=='cs_pub
 t.join(timeout=15);check(not t.is_alive() and result.get('status')==200,'Original publication completes')
 s,body,_=request('/?p='+str(posts[1]));check('CS_CONCURRENT_REVIEWED_SECOND' in body and 'CS_CONCURRENT_UNAPPROVED' not in body,'Only approved snapshot reaches public content')
 barrier.unlink(missing_ok=True)
-print('Success: '+str(count)+' concurrent HTTP assertions passed.')
+finish('concurrent HTTP')
